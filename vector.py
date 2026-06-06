@@ -76,11 +76,15 @@ def ensure_embeddings(messages, cache_path):
     return embeddings
 
 
-def vector_rank(query, messages, cache_path, top_k=None):
+def vector_rank(query, messages, cache_path, top_k=None, min_similarity=0.0):
     """Rank messages by cosine similarity to the query.
 
     Returns a list of (index, similarity) best-first, skipping the system
     message. Embeddings are L2-normalized, so a dot product is cosine similarity.
+
+    `min_similarity` is a relevance floor: matches below it are dropped. Unlike
+    Letta (whose search is agent-invoked, so the LLM filters relevance), we
+    auto-inject results, so we need this floor to avoid injecting noise.
     """
     if not messages:
         return []
@@ -91,6 +95,8 @@ def vector_rank(query, messages, cache_path, top_k=None):
 
     ranked = []
     for i in np.argsort(-sims):  # descending similarity
+        if sims[i] < min_similarity:
+            break  # everything after this is lower; stop (relevance floor)
         if messages[i]["role"] == "system":
             continue  # the system prompt is always present; skip it
         ranked.append((int(i), float(sims[i])))

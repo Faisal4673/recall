@@ -138,7 +138,7 @@ def _conversational_pair(messages, idx):
 
 
 def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
-                   channel_depth, bm25_weight, vector_weight):
+                   channel_depth, bm25_weight, vector_weight, min_similarity):
     """Hybrid recall: BM25 + semantic vector channels fused with RRF."""
     import vector  # deferred: importing torch/sentence-transformers is slow
 
@@ -149,9 +149,12 @@ def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
     if not messages:
         return []
 
-    # Two independent rankings over the same messages, then fuse by rank.
+    # Two independent rankings over the same messages, then fuse by rank. Each
+    # channel is gated for relevance (BM25 by coverage, vector by similarity) so
+    # an off-topic query injects nothing rather than the least-irrelevant turn.
     bm25_ids = [idx for idx, _ in bm25_rank(keywords, messages, min_coverage)[:channel_depth]]
-    vec_ids = [idx for idx, _ in vector.vector_rank(query, messages, cache_path, top_k=channel_depth)]
+    vec_ids = [idx for idx, _ in vector.vector_rank(
+        query, messages, cache_path, top_k=channel_depth, min_similarity=min_similarity)]
     fused = reciprocal_rank_fusion(
         [bm25_ids, vec_ids],
         weights=[bm25_weight, vector_weight],
@@ -171,9 +174,9 @@ def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
 
 
 def search_cache(user_input, cache_path="global_kv_cache.txt",
-                 min_coverage=0.3, top_k=1,
+                 min_coverage=0.3, top_k=3,
                  search_mode="bm25", channel_depth=50,
-                 bm25_weight=0.5, vector_weight=0.5):
+                 bm25_weight=0.5, vector_weight=0.5, min_similarity=0.3):
     """Find the best-matching chunk(s) of the cache for the given user input.
 
     Returns the top `top_k` matches, each expanded to its (user, assistant)
@@ -186,10 +189,14 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
         fused with Reciprocal Rank Fusion, matching Letta's recall search. Loads
         the model and embeddings, so it's heavier; opt in when you want it.
 
-    `min_coverage` is the BM25 accept/reject gate: a keyword match must contain
-    at least this fraction of the query keywords. BM25 scores aren't normalized
-    to 0..1, so coverage (not the raw score) is what we threshold on. The vector
-    channel isn't gated this way -- it surfaces semantic matches BM25 misses.
+    Each channel has its own relevance floor so an off-topic query injects
+    nothing rather than the least-irrelevant turn:
+      - `min_coverage`: BM25 gate -- a match must contain at least this fraction
+        of the query keywords (BM25 scores aren't 0..1, so we gate on coverage).
+      - `min_similarity`: vector gate -- a match must reach this cosine
+        similarity. The 0.3 default suits all-MiniLM-L6-v2 and is tunable.
+    Letta needs neither (its search is agent-invoked, so the LLM filters
+    results); we auto-inject, so we gate here instead.
 
     The BM25 path streams, but corpus stats (IDF) require holding the *matching*
     messages until the pass completes -- memory scales with the number of
@@ -203,7 +210,7 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
     if search_mode == "hybrid":
         return _hybrid_search(user_input, keywords, cache_path, min_coverage,
                               top_k, channel_depth,
-                              bm25_weight, vector_weight)
+                              bm25_weight, vector_weight, min_similarity)
 
     num_docs = 0
     total_len = 0

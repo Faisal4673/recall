@@ -12,3 +12,6 @@ global_kv_cache.txt
 
 # Cloned reference repos (exploration only)
 letta_tests/
+
+# Local debug harness (untracked)
+debug/
