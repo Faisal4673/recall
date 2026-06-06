@@ -8,6 +8,7 @@ __pycache__/
 
 # Runtime-generated memory store
 global_kv_cache.txt
+*.emb.npy
 
 # Cloned reference repos (exploration only)
 letta_tests/

@@ -60,25 +60,44 @@ first; the other two are the roadmap.
    holds the *matching* messages until the streaming pass finishes. Memory
    scales with the number of matches (a posting list), not the whole cache.
 
-2. **Semantic channel — vector ANN.** ⬜ Next. Letta ranks messages a second way
-   with `("vector", "ANN", query_embedding)` over embeddings, catching meaning
-   and synonyms that keywords miss. This needs an embedding model + a vector
-   store. The blocker is a dependency/provider decision (DeepSeek has no
-   embeddings endpoint; options are OpenAI embeddings, a local
-   sentence-transformers model, or `sqlite-vec` for an on-disk index).
+2. **Semantic channel — vector ANN.** ✅ Done (`vector.py`). Letta ranks messages
+   a second way with `("vector", "ANN", query_embedding)` over embeddings,
+   catching meaning and synonyms that keywords miss. We embed messages with a
+   local **sentence-transformers** model (`all-MiniLM-L6-v2`) — offline, free, no
+   API key (DeepSeek has no embeddings endpoint). Embeddings are persisted next
+   to the cache (`*.emb.npy`, index-aligned, one row per line) so each message is
+   embedded only once. Similarity is cosine (vectors are L2-normalized, so a dot
+   product suffices).
 
-3. **Fusion — Reciprocal Rank Fusion (RRF).** ⬜ After the vector channel exists.
-   Letta merges the two ranked lists by *rank*, not raw score:
+   Tradeoff: this is **brute-force** vector search — it loads the whole embedding
+   matrix into memory and compares every row. Fine at our scale; an on-disk ANN
+   index (`sqlite-vec` / FAISS) is the future step.
 
-       score(doc) = vector_weight / (k + vector_rank)
-                  + fts_weight    / (k + fts_rank)
+3. **Fusion — Reciprocal Rank Fusion (RRF).** ✅ Done (`reciprocal_rank_fusion`
+   in search.py). Merges the ranked lists by *rank*, not raw score:
+
+       score(doc) = bm25_weight   / (k + bm25_rank)
+                  + vector_weight / (k + vector_rank)
 
    with `k = 60` (Cormack et al. 2009), ranks 1-based, and a doc missing from a
    list simply contributes nothing from that channel. Sort by combined score,
-   take top_k. Default weights are 0.5 / 0.5. RRF is robust because it never has
-   to reconcile BM25's unbounded scores with cosine similarities — it only
-   compares positions.
+   take top_k. Default weights 0.5 / 0.5. RRF is robust because it never has to
+   reconcile BM25's unbounded scores with cosine similarities — it only compares
+   positions.
 
-So our `search_cache` already returns a BM25-ranked top_k (the FTS half of
-Letta's hybrid). Adding the vector channel + RRF is what would make it a true
-hybrid recall search.
+`search_cache(..., search_mode="hybrid")` now runs both channels and fuses them
+— a true hybrid recall search, matching Letta. The default `search_mode="bm25"`
+stays lightweight (no torch import) for the basic chatbot.
+
+### Remaining / known nuances
+
+- **On-disk ANN index** is the next efficiency step (replaces brute-force vector
+  + the BM25 full scan); see the SQLite/FTS5 + `sqlite-vec` notes above.
+- **Conversational-pair expansion:** ✅ Done (`_conversational_pair`, plus the
+  `prev_message` lookback in the streaming path). A match expands to its
+  (user, assistant) exchange regardless of which side it landed on -- an
+  assistant match (common from the vector channel) pairs back to its preceding
+  user question instead of pulling the next, possibly unrelated, turn. This
+  replaced the old trailing-only `context` knob.
+- **main.py** still calls the default BM25 mode; flip it to `search_mode="hybrid"`
+  to use semantic recall (loads the model on first search).

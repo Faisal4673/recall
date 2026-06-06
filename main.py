@@ -55,17 +55,33 @@ if not os.path.exists(KV_CACHE_PATH):
 # The conversation starts with the system prompt and grows as we chat.
 conversation = [{"role": "system", "content": system_prompt}]
 
+# (role, content) of everything already in the conversation. Maintained
+# incrementally so dedup is an O(1) lookup, never a re-scan of the whole list.
+seen = {("system", system_prompt)}
+
+
+def add_to_conversation(message):
+    # Append a message and record it so future injections can skip duplicates.
+    conversation.append(message)
+    seen.add((message["role"], message["content"]))
+
+
 # Simple agent loop: read input, respond, remember, repeat.
 while True:
     user_input = input("You: ")
 
-    # Break the input into keywords, search the cache, and splice the best
-    # matching real turns into the live conversation before the new prompt.
+    # Break the input into keywords and search the cache for relevant turns.
     relevant = search_cache(user_input)
-    conversation.extend(relevant)
+
+    # Inject only retrieved turns not already present. Because we preserve exact
+    # structure, a re-retrieved turn matches exactly and is skipped -- this keeps
+    # the same memory from compounding into the conversation turn after turn.
+    for message in relevant:
+        if (message["role"], message["content"]) not in seen:
+            add_to_conversation(message)
 
     # Add the user's message to the conversation history and persist it.
-    conversation.append({"role": "user", "content": user_input})
+    add_to_conversation({"role": "user", "content": user_input})
     write_to_cache("user", user_input)
 
     # Generate a response, streaming it back token by token as it's produced.
@@ -87,5 +103,5 @@ while True:
     print()  # newline after the streamed response
 
     # Add the assistant's reply to the history and persist it.
-    conversation.append({"role": "assistant", "content": reply})
+    add_to_conversation({"role": "assistant", "content": reply})
     write_to_cache("assistant", reply)
