@@ -6,6 +6,7 @@ from openai import OpenAI
 
 from search import search_cache
 from functs import load_tools
+import ui
 
 # Load DEEPSEEK_API_KEY from the .env file into the environment.
 load_dotenv()
@@ -150,9 +151,10 @@ def execute_tool(name, arguments):
 
 def chat_loop():
     # Simple agent loop: read input, respond (calling tools as needed), remember.
+    ui.welcome()
     while True:
         try:
-            user_input = input("You: ")
+            user_input = ui.animated_input("You")
         except (EOFError, KeyboardInterrupt):
             print()  # tidy newline, then exit on Ctrl-D / Ctrl-C
             break
@@ -181,7 +183,7 @@ def chat_loop():
         # until it returns a plain text answer with no further tool calls.
         while True:
             stream = client.chat.completions.create(
-                model="deepseek-chat",
+                model="deepseek-v4-flash",
                 messages=normalize_messages(conversation),
                 tools=tool_schemas,
                 stream=True,
@@ -190,17 +192,35 @@ def chat_loop():
             # Stream the reply, printing text as it arrives and assembling any
             # tool calls from their streamed fragments. Tool-call deltas arrive
             # per index: id and function.name come once, arguments accumulates.
-            print("Assistant: ", end="", flush=True)
+            # Thinking models stream their reasoning in `reasoning_content`
+            # first; we show an animated "thinking" indicator until the actual
+            # answer (or a tool call) begins, then print under a red "agent:".
             reply = ""
-            tool_calls = {}  # index -> {"id", "name", "arguments"}
+            tool_calls = {}    # index -> {"id", "name", "arguments"}
+            thinking = None    # the running thinking animation, if any
+            answer_started = False
             for chunk in stream:
                 if not chunk.choices:
                     continue  # final usage-only chunk has no choices
                 delta = chunk.choices[0].delta
+
+                if getattr(delta, "reasoning_content", None) and thinking is None:
+                    thinking = ui.thinking_indicator()
+
                 if delta.content:
+                    if thinking is not None:
+                        thinking.stop()
+                        thinking = None
+                    if not answer_started:
+                        print(ui.AGENT_LABEL, end="", flush=True)
+                        answer_started = True
                     reply += delta.content
                     print(delta.content, end="", flush=True)
+
                 if delta.tool_calls:
+                    if thinking is not None:
+                        thinking.stop()
+                        thinking = None
                     for tc in delta.tool_calls:
                         slot = tool_calls.setdefault(
                             tc.index, {"id": "", "name": "", "arguments": ""})
@@ -210,7 +230,11 @@ def chat_loop():
                             slot["name"] = tc.function.name
                         if tc.function and tc.function.arguments:
                             slot["arguments"] += tc.function.arguments
-            print()  # newline after the streamed response
+
+            if thinking is not None:
+                thinking.stop()  # stream ended while still "thinking"
+            if answer_started:
+                print()  # newline after the streamed response
 
             # Assemble the assistant message in API shape: its text plus any
             # tool calls, ordered by index. content is None for a pure tool call.
