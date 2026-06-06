@@ -10,6 +10,9 @@ __pycache__/
 global_kv_cache.txt
 *.emb.npy
 
+# The agent's sandbox: runtime working files (auto-created on import)
+agent_workspace/
+
 # Cloned reference repos (exploration only)
 letta_tests/
 

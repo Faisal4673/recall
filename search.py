@@ -79,7 +79,8 @@ def bm25_rank(keywords, messages, min_coverage):
     for idx, message in enumerate(messages):
         if message["role"] == "system":
             continue
-        tokens = tokenize(message["content"])
+        # content is None on an assistant(tool_calls) message.
+        tokens = tokenize(message.get("content") or "")
         num_docs += 1
         total_len += len(tokens)
         counts = Counter(tokens)
@@ -121,20 +122,33 @@ def reciprocal_rank_fusion(rankings, k=60, weights=None, top_k=1):
     return sorted(scores, key=lambda d: scores[d], reverse=True)[:top_k]
 
 
-def _conversational_pair(messages, idx):
-    """Expand a match into the (user, assistant) exchange it belongs to.
+def _turn_cluster(messages, idx):
+    """Expand a match into the whole turn it belongs to.
 
-    A match can land on either side of an exchange -- the vector channel often
-    matches an assistant reply. So a user match brings back its following reply,
-    and an assistant match brings back its preceding question, rather than always
-    pulling the (possibly unrelated) *next* turn.
+    A turn is a self-contained unit: the user message that starts it, through
+    everything up to (but not including) the next user message -- which now
+    includes any assistant(tool_calls) -> tool-result rounds and the final
+    answer. Returning the *whole* turn (rather than just a user/assistant pair)
+    is what lets tool exchanges be injected back into the conversation as a
+    valid, API-legal sequence: a tool result never arrives without its call, and
+    a tool call never arrives without its results.
+
+    A match can land anywhere inside the turn (the vector channel often matches
+    an assistant reply or a tool result); we walk back to the turn's opening user
+    message and forward to the next one to recover the full span.
     """
-    message = messages[idx]
-    if message["role"] == "assistant" and idx > 0 and messages[idx - 1]["role"] == "user":
-        return [messages[idx - 1], message]
-    if message["role"] == "user" and idx + 1 < len(messages) and messages[idx + 1]["role"] == "assistant":
-        return [message, messages[idx + 1]]
-    return [message]
+    start = idx
+    # Walk back to the user message that opens this turn.
+    while start > 0 and messages[start]["role"] != "user":
+        start -= 1
+    # Never let a turn start on the leading system prompt.
+    if messages[start]["role"] == "system":
+        start += 1
+    # Walk forward to the message just before the next turn's user message.
+    end = idx + 1
+    while end < len(messages) and messages[end]["role"] != "user":
+        end += 1
+    return messages[start:end]
 
 
 def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
@@ -161,26 +175,33 @@ def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
         top_k=top_k,
     )
 
-    # Expand each match into its conversational pair, skipping repeats.
-    result = []
-    seen = set()
+    # Expand each match into its whole turn, deduping turns that two matches
+    # share (identified by their opening message). Returns a list of clusters,
+    # each a self-contained, injectable turn.
+    clusters = []
+    seen_starts = set()
     for idx in fused:
-        for message in _conversational_pair(messages, idx):
-            key = id(message)
-            if key not in seen:
-                seen.add(key)
-                result.append(message)
-    return result
+        cluster = _turn_cluster(messages, idx)
+        if not cluster:
+            continue
+        key = id(cluster[0])  # identity of the turn's first message
+        if key not in seen_starts:
+            seen_starts.add(key)
+            clusters.append(cluster)
+    return clusters
 
 
 def search_cache(user_input, cache_path="global_kv_cache.txt",
                  min_coverage=0.3, top_k=3,
                  search_mode="bm25", channel_depth=50,
                  bm25_weight=0.5, vector_weight=0.5, min_similarity=0.3):
-    """Find the best-matching chunk(s) of the cache for the given user input.
+    """Find the best-matching turn(s) of the cache for the given user input.
 
-    Returns the top `top_k` matches, each expanded to its (user, assistant)
-    conversational pair, or an empty list if nothing matches well.
+    Returns up to `top_k` turn clusters, best first -- each a list of messages
+    spanning a whole turn (its user message through any assistant(tool_calls)/
+    tool-result rounds to the final answer) -- or an empty list if nothing
+    matches well. Returning whole turns keeps tool exchanges injectable as
+    valid, self-contained sequences.
 
     `search_mode`:
       - "bm25"  (default): keyword ranking only. Streams the file and needs no
@@ -215,10 +236,13 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
     num_docs = 0
     total_len = 0
     doc_freq = {kw: 0 for kw in keywords}
-    candidates = []      # each: {"chunk", "awaiting_reply", "tf", "doc_len"}
-    prev_message = None  # one-message lookback, so an assistant match can pair
-                         # back to its preceding user question
+    turns = []       # finalized turns: each {"messages": [...], "matches": [...]}
+    current = None   # the turn being accumulated; matches is [(tf, doc_len), ...]
 
+    # Stream the cache, grouping messages into turns (a turn opens on each user
+    # message) and recording, per turn, the BM25 stats of every message that
+    # matched. We keep whole matching turns rather than one-off messages so a
+    # match anywhere in a tool exchange brings the entire valid sequence with it.
     try:
         with open(cache_path) as f:
             for line in f:
@@ -226,66 +250,53 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
                 if not line:
                     continue
                 message = json.loads(line)
+                if message["role"] == "system":
+                    continue  # the system prompt never belongs to a turn
 
-                # If a prior user match is waiting for its reply, attach this
-                # message when it's the assistant turn, then stop waiting.
-                for cand in candidates:
-                    if cand["awaiting_reply"]:
-                        if message["role"] == "assistant":
-                            cand["chunk"].append(message)
-                        cand["awaiting_reply"] = False
+                # A user message opens a new turn; so does the very first message.
+                if message["role"] == "user" or current is None:
+                    if current is not None:
+                        turns.append(current)
+                    current = {"messages": [], "matches": []}
+                current["messages"].append(message)
 
-                if message["role"] != "system":
-                    tokens = tokenize(message["content"])
-                    num_docs += 1
-                    total_len += len(tokens)
+                # content is None on an assistant(tool_calls) message.
+                tokens = tokenize(message.get("content") or "")
+                num_docs += 1
+                total_len += len(tokens)
 
-                    # Count how often each query keyword appears in this message.
-                    counts = Counter(tokens)
-                    tf = {kw: counts[kw] for kw in keywords if counts[kw] > 0}
-                    if tf:
-                        for term in tf:
-                            doc_freq[term] += 1
+                # Count how often each query keyword appears in this message.
+                counts = Counter(tokens)
+                tf = {kw: counts[kw] for kw in keywords if counts[kw] > 0}
+                if tf:
+                    for term in tf:
+                        doc_freq[term] += 1
+                    current["matches"].append((tf, len(tokens)))
 
-                        # Expand the match into its conversational pair: an
-                        # assistant match pairs back to the preceding user turn;
-                        # a user match awaits the following assistant reply.
-                        if message["role"] == "assistant" and prev_message and prev_message["role"] == "user":
-                            chunk, awaiting = [prev_message, message], False
-                        elif message["role"] == "user":
-                            chunk, awaiting = [message], True
-                        else:
-                            chunk, awaiting = [message], False
-                        candidates.append({
-                            "chunk": chunk,
-                            "awaiting_reply": awaiting,
-                            "tf": tf,
-                            "doc_len": len(tokens),
-                        })
-
-                prev_message = message
+            if current is not None:
+                turns.append(current)
     except FileNotFoundError:
         return []
 
-    if not candidates:
+    if num_docs == 0:
         return []
 
-    # Score every candidate with BM25 now that corpus stats are known.
+    # Score each matching turn by its best-scoring message, gate on that
+    # message's coverage, rank, and return the top_k whole turns.
     avg_doc_len = total_len / num_docs
-    for cand in candidates:
-        cand["score"] = bm25_score(
-            cand["tf"], cand["doc_len"], avg_doc_len, doc_freq, num_docs)
-        cand["coverage"] = len(cand["tf"]) / len(keywords)
+    ranked = []
+    for turn in turns:
+        if not turn["matches"]:
+            continue
+        best_score = 0.0
+        best_coverage = 0.0
+        for tf, doc_len in turn["matches"]:
+            best_score = max(best_score, bm25_score(
+                tf, doc_len, avg_doc_len, doc_freq, num_docs))
+            best_coverage = max(best_coverage, len(tf) / len(keywords))
+        if best_coverage < min_coverage:
+            continue  # coverage gate
+        ranked.append((best_score, turn["messages"]))
 
-    # Keep only matches that clear the coverage gate, rank by BM25, take top_k.
-    ranked = sorted(
-        (c for c in candidates if c["coverage"] >= min_coverage),
-        key=lambda c: c["score"],
-        reverse=True,
-    )[:top_k]
-
-    # Flatten the selected chunks (best first) into one message list.
-    result = []
-    for cand in ranked:
-        result.extend(cand["chunk"])
-    return result
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [messages for _, messages in ranked[:top_k]]

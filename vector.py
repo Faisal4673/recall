@@ -38,7 +38,7 @@ def _embeddings_path(cache_path):
 
 
 def load_messages(cache_path):
-    """Read the JSONL cache into a list of {"role", "content"} dicts."""
+    """Read the JSONL cache into a list of message dicts."""
     messages = []
     with open(cache_path) as f:
         for line in f:
@@ -46,6 +46,25 @@ def load_messages(cache_path):
             if line:
                 messages.append(json.loads(line))
     return messages
+
+
+def message_text(message):
+    """The text we embed for a message, across every message kind.
+
+    Plain user/assistant turns embed their content. An assistant message that
+    makes tool calls has content None, so we synthesize text from the calls it
+    makes (each function name + its arguments) so the *action* is semantically
+    findable, not invisible. Tool results embed their content string. Anything
+    without usable text embeds as "" (a valid, near-neutral vector).
+    """
+    content = message.get("content")
+    if content:
+        return content
+    if message.get("tool_calls"):
+        return " ".join(
+            f'{call["function"]["name"]} {call["function"]["arguments"]}'
+            for call in message["tool_calls"])
+    return ""
 
 
 def ensure_embeddings(messages, cache_path):
@@ -65,7 +84,7 @@ def ensure_embeddings(messages, cache_path):
 
     start = len(cached) if cached is not None else 0
     if start < len(messages):
-        new_texts = [m["content"] for m in messages[start:]]
+        new_texts = [message_text(m) for m in messages[start:]]
         new_emb = get_model().encode(new_texts, normalize_embeddings=True)
         new_emb = np.asarray(new_emb, dtype=np.float32)
         embeddings = np.vstack([cached, new_emb]) if cached is not None else new_emb
