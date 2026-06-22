@@ -1,8 +1,4 @@
-"""Tool: create a directory (and parents) inside the agent workspace.
-
-Kept as its own tool after merging create-file into write_file: making an empty
-directory is the one creation primitive writing a file doesn't already cover.
-"""
+"""Tool: create a directory (and parents) inside the agent workspace."""
 
 import os
 

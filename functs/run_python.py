@@ -1,13 +1,7 @@
-"""Tool: run a Python script inside the agent workspace.
+"""Tool: run Python source in a subprocess, cwd pinned to the workspace.
 
-Takes a snippet of Python source, runs it with the project interpreter in a
-subprocess whose working directory is the workspace, and returns its stdout,
-stderr, and exit code.
-
-Honest boundary (see _workspace and comments.md): cwd is pinned to the
-workspace, but Python can open any path or reach the network -- this tool is NOT
-confined to the sandbox the way the file tools are. It's a convenience for a
-trusted, local, learning setup, not a security boundary.
+Returns stdout, stderr, and exit code. cwd is the workspace, but Python can open
+any path or reach the network -- this is not confined the way the file tools are.
 """
 
 import subprocess
@@ -15,7 +9,6 @@ import sys
 
 from . import _workspace
 
-# Kill runaway scripts so one bad call can't hang the whole agent.
 TIMEOUT_SECONDS = 30
 
 SCHEMA = {

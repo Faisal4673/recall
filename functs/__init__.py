@@ -1,28 +1,14 @@
-"""Tool definitions for the agent, one tool per module.
+"""Tool definitions, one tool per module.
 
-Per-file convention (this is the contract the agent loop will rely on):
+Each non-underscore module exposes two names:
 
-    Every tool module that is NOT underscore-prefixed exposes exactly two names:
+    SCHEMA : the OpenAI function-calling definition; `function.name` must equal
+             the module name so a tool_call maps back to its handler.
+    run(**kwargs) -> str : the implementation. Returns error text rather than
+             raising, so one bad call can't kill the loop.
 
-      SCHEMA : dict
-          The DeepSeek/OpenAI function-calling tool definition, shaped as
-          {"type": "function",
-           "function": {"name", "description", "parameters": {JSON Schema}}}.
-          `function.name` MUST equal the module name, so a returned tool_call
-          name maps straight back to the module that handles it.
-
-      run(**kwargs) -> str
-          The implementation. It receives the arguments the model supplied
-          (already JSON-decoded), does the work, and returns a string -- the
-          content sent back in the role:"tool" reply. Tools return error text
-          rather than raising, so one bad call can't kill the loop.
-
-    Underscore-prefixed modules (e.g. _workspace) are shared helpers and are
-    skipped by discovery, never exposed as tools.
-
-`load_tools()` below is the discovery step that turns this convention into a
-registry. The agent loop (added later, separately) just calls it -- it never
-hardcodes tool names.
+Underscore-prefixed modules (e.g. _workspace) are shared helpers, skipped by
+discovery.
 """
 
 import importlib

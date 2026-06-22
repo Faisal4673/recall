@@ -1,10 +1,7 @@
 """BM25 keyword search over the global KV cache.
 
-The flow this supports: take the user's input, reduce it to keywords, then rank
-the persisted conversation cache with BM25 (the same full-text ranking Letta's
-recall memory uses). The best-matching chunk(s) (a message plus its reply) are
-returned so they can be prepended to the live conversation before the new user
-prompt. See comments.md for how this maps to Letta and what comes next.
+Reduce the user's input to keywords, rank the persisted conversation cache with
+BM25, and return the best-matching turn(s) for recall.
 """
 
 import json
@@ -13,10 +10,30 @@ import re
 from collections import Counter
 
 # BM25 tuning constants (Lucene/Elasticsearch defaults).
-BM25_K1 = 1.5   # term-frequency saturation: how fast repeated terms stop helping
-BM25_B = 0.75   # length normalization: how much long messages are penalized
+BM25_K1 = 1.5   # term-frequency saturation
+BM25_B = 0.75   # length normalization
 
-# Common words that carry little meaning and would pollute keyword matching.
+# raw_decode recovers every object on a line, so a missing newline (two records
+# run together) can't crash recall. An undecodable remainder is skipped.
+_DECODER = json.JSONDecoder()
+
+
+def iter_json_objects(line):
+    """Yield each JSON object found in `line`, tolerating several run together."""
+    idx, length = 0, len(line)
+    while idx < length:
+        while idx < length and line[idx].isspace():
+            idx += 1  # skip whitespace between (and around) objects
+        if idx >= length:
+            break
+        try:
+            obj, idx = _DECODER.raw_decode(line, idx)
+        except json.JSONDecodeError:
+            break  # undecodable remainder: skip the rest of this line
+        yield obj
+
+
+# Common words dropped from keyword matching.
 STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "then", "is", "are", "was",
     "were", "be", "been", "to", "of", "in", "on", "for", "with", "as", "at",
@@ -32,17 +49,12 @@ def tokenize(text):
 
 
 def extract_keywords(text):
-    """Reduce text to a set of meaningful keywords, dropping stopwords/noise."""
-    # Keep tokens that aren't stopwords and are longer than two characters.
+    """Reduce text to keywords, dropping stopwords and tokens of <=2 chars."""
     return {w for w in tokenize(text) if w not in STOPWORDS and len(w) > 2}
 
 
 def bm25_score(tf, doc_len, avg_doc_len, doc_freq, num_docs):
     """BM25 relevance score for one message given corpus statistics.
-
-    This is the ranking function Letta's recall full-text channel uses. Unlike a
-    raw keyword-overlap count it rewards rare terms (IDF), saturates repeated
-    terms (k1), and normalizes for message length (b).
 
     Args:
         tf: {term: count} of query terms found in this message.
@@ -67,9 +79,8 @@ def bm25_score(tf, doc_len, avg_doc_len, doc_freq, num_docs):
 def bm25_rank(keywords, messages, min_coverage):
     """Rank an in-memory list of messages by BM25; returns [(index, score)].
 
-    The hybrid path uses this because it already has every message loaded (the
-    vector channel needs them). The streaming branch in `search_cache` is the
-    memory-light equivalent for BM25-only mode.
+    Used by the hybrid path, which already has every message loaded. The
+    streaming branch in `search_cache` is the memory-light BM25-only equivalent.
     """
     num_docs = 0
     total_len = 0
@@ -79,7 +90,6 @@ def bm25_rank(keywords, messages, min_coverage):
     for idx, message in enumerate(messages):
         if message["role"] == "system":
             continue
-        # content is None on an assistant(tool_calls) message.
         tokens = tokenize(message.get("content") or "")
         num_docs += 1
         total_len += len(tokens)
@@ -105,13 +115,11 @@ def bm25_rank(keywords, messages, min_coverage):
 
 
 def reciprocal_rank_fusion(rankings, k=60, weights=None, top_k=1):
-    """Fuse several ranked id-lists into one, the way Letta's recall search does.
+    """Fuse several best-first id-lists into one, returning the top_k ids.
 
-    Each entry in `rankings` is a list of ids ordered best-first. An id's fused
-    score is sum(weight / (k + rank)) over the lists it appears in (rank is
-    1-based); an id missing from a list contributes nothing from it. k=60 follows
-    Cormack et al. (2009). Fusing by *rank* avoids having to reconcile BM25's
-    unbounded scores with cosine similarities. Returns the top_k fused ids.
+    An id's score is sum(weight / (k + rank)) over the lists it appears in
+    (1-based rank). k=60 follows Cormack et al. (2009). Fusing by rank avoids
+    reconciling BM25's unbounded scores with cosine similarities.
     """
     if weights is None:
         weights = [1.0] * len(rankings)
@@ -123,28 +131,17 @@ def reciprocal_rank_fusion(rankings, k=60, weights=None, top_k=1):
 
 
 def _turn_cluster(messages, idx):
-    """Expand a match into the whole turn it belongs to.
+    """Expand a match into its whole turn (opening user message + its answer).
 
-    A turn is a self-contained unit: the user message that starts it, through
-    everything up to (but not including) the next user message -- which now
-    includes any assistant(tool_calls) -> tool-result rounds and the final
-    answer. Returning the *whole* turn (rather than just a user/assistant pair)
-    is what lets tool exchanges be injected back into the conversation as a
-    valid, API-legal sequence: a tool result never arrives without its call, and
-    a tool call never arrives without its results.
-
-    A match can land anywhere inside the turn (the vector channel often matches
-    an assistant reply or a tool result); we walk back to the turn's opening user
-    message and forward to the next one to recover the full span.
+    Returning the whole turn pairs a match on either side back to its
+    counterpart -- the vector channel often matches an assistant reply, which we
+    want back with the question that prompted it.
     """
     start = idx
-    # Walk back to the user message that opens this turn.
     while start > 0 and messages[start]["role"] != "user":
         start -= 1
-    # Never let a turn start on the leading system prompt.
     if messages[start]["role"] == "system":
-        start += 1
-    # Walk forward to the message just before the next turn's user message.
+        start += 1  # never start a turn on the leading system prompt
     end = idx + 1
     while end < len(messages) and messages[end]["role"] != "user":
         end += 1
@@ -163,9 +160,8 @@ def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
     if not messages:
         return []
 
-    # Two independent rankings over the same messages, then fuse by rank. Each
-    # channel is gated for relevance (BM25 by coverage, vector by similarity) so
-    # an off-topic query injects nothing rather than the least-irrelevant turn.
+    # Two independent rankings, each relevance-gated (BM25 by coverage, vector
+    # by similarity), then fused by rank.
     bm25_ids = [idx for idx, _ in bm25_rank(keywords, messages, min_coverage)[:channel_depth]]
     vec_ids = [idx for idx, _ in vector.vector_rank(
         query, messages, cache_path, top_k=channel_depth, min_similarity=min_similarity)]
@@ -175,9 +171,7 @@ def _hybrid_search(query, keywords, cache_path, min_coverage, top_k,
         top_k=top_k,
     )
 
-    # Expand each match into its whole turn, deduping turns that two matches
-    # share (identified by their opening message). Returns a list of clusters,
-    # each a self-contained, injectable turn.
+    # Expand each match into its whole turn, deduping turns two matches share.
     clusters = []
     seen_starts = set()
     for idx in fused:
@@ -197,32 +191,19 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
                  bm25_weight=0.5, vector_weight=0.5, min_similarity=0.3):
     """Find the best-matching turn(s) of the cache for the given user input.
 
-    Returns up to `top_k` turn clusters, best first -- each a list of messages
-    spanning a whole turn (its user message through any assistant(tool_calls)/
-    tool-result rounds to the final answer) -- or an empty list if nothing
-    matches well. Returning whole turns keeps tool exchanges injectable as
-    valid, self-contained sequences.
+    Returns up to `top_k` turn clusters best first (each a whole turn: its user
+    message and the assistant answer), or [] if nothing matches well.
 
     `search_mode`:
-      - "bm25"  (default): keyword ranking only. Streams the file and needs no
-        heavy dependencies -- the lightweight default for the chatbot.
-      - "hybrid": BM25 + a semantic vector channel (sentence-transformers),
-        fused with Reciprocal Rank Fusion, matching Letta's recall search. Loads
-        the model and embeddings, so it's heavier; opt in when you want it.
+      - "bm25"  (default): keyword ranking only; streams the file, no heavy deps.
+      - "hybrid": BM25 + a sentence-transformers vector channel, fused with RRF.
+        Loads the model and embeddings, so it's heavier; opt in.
 
-    Each channel has its own relevance floor so an off-topic query injects
-    nothing rather than the least-irrelevant turn:
-      - `min_coverage`: BM25 gate -- a match must contain at least this fraction
-        of the query keywords (BM25 scores aren't 0..1, so we gate on coverage).
-      - `min_similarity`: vector gate -- a match must reach this cosine
-        similarity. The 0.3 default suits all-MiniLM-L6-v2 and is tunable.
-    Letta needs neither (its search is agent-invoked, so the LLM filters
-    results); we auto-inject, so we gate here instead.
-
-    The BM25 path streams, but corpus stats (IDF) require holding the *matching*
-    messages until the pass completes -- memory scales with the number of
-    matches, not the whole cache. The hybrid path loads all messages (brute-force
-    vector search). See comments.md for the on-disk-index next step.
+    Each channel has a relevance floor so an off-topic query injects nothing:
+      - `min_coverage`: BM25 gate -- fraction of query keywords a match must
+        contain (BM25 scores aren't 0..1, so we gate on coverage).
+      - `min_similarity`: vector gate -- minimum cosine similarity (0.3 suits
+        all-MiniLM-L6-v2).
     """
     keywords = extract_keywords(user_input)
     if not keywords:
@@ -239,39 +220,32 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
     turns = []       # finalized turns: each {"messages": [...], "matches": [...]}
     current = None   # the turn being accumulated; matches is [(tf, doc_len), ...]
 
-    # Stream the cache, grouping messages into turns (a turn opens on each user
-    # message) and recording, per turn, the BM25 stats of every message that
-    # matched. We keep whole matching turns rather than one-off messages so a
-    # match anywhere in a tool exchange brings the entire valid sequence with it.
+    # Stream the cache, grouping messages into turns (one opens on each user
+    # message) and recording per turn the BM25 stats of every matching message.
     try:
         with open(cache_path) as f:
             for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                message = json.loads(line)
-                if message["role"] == "system":
-                    continue  # the system prompt never belongs to a turn
+                for message in iter_json_objects(line):
+                    if message["role"] == "system":
+                        continue  # the system prompt never belongs to a turn
 
-                # A user message opens a new turn; so does the very first message.
-                if message["role"] == "user" or current is None:
-                    if current is not None:
-                        turns.append(current)
-                    current = {"messages": [], "matches": []}
-                current["messages"].append(message)
+                    # A user message opens a new turn; so does the first message.
+                    if message["role"] == "user" or current is None:
+                        if current is not None:
+                            turns.append(current)
+                        current = {"messages": [], "matches": []}
+                    current["messages"].append(message)
 
-                # content is None on an assistant(tool_calls) message.
-                tokens = tokenize(message.get("content") or "")
-                num_docs += 1
-                total_len += len(tokens)
+                    tokens = tokenize(message.get("content") or "")
+                    num_docs += 1
+                    total_len += len(tokens)
 
-                # Count how often each query keyword appears in this message.
-                counts = Counter(tokens)
-                tf = {kw: counts[kw] for kw in keywords if counts[kw] > 0}
-                if tf:
-                    for term in tf:
-                        doc_freq[term] += 1
-                    current["matches"].append((tf, len(tokens)))
+                    counts = Counter(tokens)
+                    tf = {kw: counts[kw] for kw in keywords if counts[kw] > 0}
+                    if tf:
+                        for term in tf:
+                            doc_freq[term] += 1
+                        current["matches"].append((tf, len(tokens)))
 
             if current is not None:
                 turns.append(current)
@@ -281,8 +255,7 @@ def search_cache(user_input, cache_path="global_kv_cache.txt",
     if num_docs == 0:
         return []
 
-    # Score each matching turn by its best-scoring message, gate on that
-    # message's coverage, rank, and return the top_k whole turns.
+    # Score each turn by its best message, gate on coverage, return top_k turns.
     avg_doc_len = total_len / num_docs
     ranked = []
     for turn in turns:

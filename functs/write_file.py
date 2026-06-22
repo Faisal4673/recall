@@ -1,8 +1,6 @@
 """Tool: write text to a file inside the agent workspace.
 
-This is the merged create-or-overwrite primitive: there is no separate
-"create file" tool, because writing a file is how you create one. Parent
-directories are created automatically, so the agent doesn't have to mkdir first.
+Creates or overwrites; parent directories are created automatically.
 """
 
 import os
@@ -43,7 +41,6 @@ def run(path, content):
     if os.path.isdir(target):
         return f"Error: {path!r} is a directory, not a file."
 
-    # Create parent dirs so the agent can write nested paths in one call.
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8") as f:
         f.write(content)

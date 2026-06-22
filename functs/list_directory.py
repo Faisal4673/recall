@@ -39,8 +39,7 @@ def run(path="."):
     if not os.path.isdir(target):
         return f"Error: {path!r} is not a directory."
 
-    # Sort for stable output; append "/" to directories so the agent can tell
-    # files and folders apart at a glance.
+    # Sorted for stable output; "/" suffix marks directories.
     entries = []
     for name in sorted(os.listdir(target)):
         full = os.path.join(target, name)

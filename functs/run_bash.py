@@ -1,12 +1,8 @@
-"""Tool: run a bash script inside the agent workspace.
+"""Tool: run a bash script in a subprocess, cwd pinned to the workspace.
 
-Takes a shell snippet, runs it with bash in a subprocess whose working directory
-is the workspace, and returns stdout, stderr, and exit code.
-
-Honest boundary (see _workspace and comments.md): cwd is pinned to the
-workspace, but bash can `cd` out, read any file, or reach the network -- this
-tool is NOT confined to the sandbox the way the file tools are. It's the widest
-capability the agent has; keep that in mind for an untrusted setup.
+Returns stdout, stderr, and exit code. cwd is the workspace, but bash can `cd`
+out, read any file, or reach the network -- this is not confined the way the
+file tools are.
 """
 
 import subprocess
@@ -49,7 +45,7 @@ def run(script):
     except subprocess.TimeoutExpired:
         return f"Error: script exceeded the {TIMEOUT_SECONDS}s time limit."
 
-    # Same stdout/stderr/exit-code shape as run_python for a consistent contract.
+    # Same stdout/stderr/exit-code shape as run_python.
     parts = []
     if result.stdout:
         parts.append("stdout:\n" + result.stdout.rstrip())

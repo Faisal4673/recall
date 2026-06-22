@@ -1,8 +1,7 @@
-"""Tool: search file contents for a regex across the agent workspace.
+"""Tool: grep-style regex search over file contents in the agent workspace.
 
-The grep-style channel that the original plan was missing: it lets the agent
-find where something lives without reading whole files. Walks the workspace
-subtree, matches each text file line-by-line, and reports `path:lineno: line`.
+Walks the workspace subtree, matches each text file line-by-line, and reports
+`path:lineno: line`.
 """
 
 import os
@@ -10,7 +9,7 @@ import re
 
 from . import _workspace
 
-# Bound the work so a search over a large tree can't run away or flood context.
+# Bound the work so a large tree can't run away or flood context.
 MAX_MATCHES = 100
 MAX_FILE_BYTES = 1_000_000
 

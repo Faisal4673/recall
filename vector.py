@@ -1,19 +1,14 @@
 """Semantic (vector) search channel over the global KV cache.
 
-This is the second of Letta's two recall channels: instead of matching keywords,
-it embeds each message into a vector and ranks by cosine similarity to the query
-embedding, so it catches meaning and synonyms that BM25 misses.
+Embeds each message and ranks by cosine similarity to the query, catching
+meaning and synonyms that BM25 misses. Embeddings come from a local
+sentence-transformers model (all-MiniLM-L6-v2) and are persisted next to the
+cache (one index-aligned row per line) so each message is embedded only once.
 
-Embeddings come from a local sentence-transformers model (all-MiniLM-L6-v2) --
-offline, free, no API key. They are persisted next to the cache (one row per
-cache line, index-aligned) so we only ever embed each message once.
-
-NOTE: This is brute-force vector search -- it loads the whole embedding matrix
-into memory and compares against every row. That's fine at our scale; a true
-on-disk ANN index (e.g. sqlite-vec / FAISS) is the next step. See comments.md.
+Brute-force search: the whole embedding matrix is loaded and compared row by
+row -- fine at this scale; an on-disk ANN index would be the next step.
 """
 
-import json
 import os
 
 import numpy as np
@@ -24,7 +19,7 @@ _model = None
 
 
 def get_model():
-    """Lazily load the embedding model (importing torch is slow, so defer it)."""
+    """Lazily load the embedding model (importing torch is slow)."""
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
@@ -38,33 +33,23 @@ def _embeddings_path(cache_path):
 
 
 def load_messages(cache_path):
-    """Read the JSONL cache into a list of message dicts."""
+    """Read the JSONL cache into a list of message dicts.
+
+    Uses the same tolerant per-line parser as the BM25 channel so a missing
+    newline (two records run together on one line) can't crash recall.
+    """
+    from search import iter_json_objects
+
     messages = []
     with open(cache_path) as f:
         for line in f:
-            line = line.strip()
-            if line:
-                messages.append(json.loads(line))
+            messages.extend(iter_json_objects(line))
     return messages
 
 
 def message_text(message):
-    """The text we embed for a message, across every message kind.
-
-    Plain user/assistant turns embed their content. An assistant message that
-    makes tool calls has content None, so we synthesize text from the calls it
-    makes (each function name + its arguments) so the *action* is semantically
-    findable, not invisible. Tool results embed their content string. Anything
-    without usable text embeds as "" (a valid, near-neutral vector).
-    """
-    content = message.get("content")
-    if content:
-        return content
-    if message.get("tool_calls"):
-        return " ".join(
-            f'{call["function"]["name"]} {call["function"]["arguments"]}'
-            for call in message["tool_calls"])
-    return ""
+    """Text to embed for a message; missing content embeds as ""."""
+    return message.get("content") or ""
 
 
 def ensure_embeddings(messages, cache_path):
@@ -98,12 +83,9 @@ def ensure_embeddings(messages, cache_path):
 def vector_rank(query, messages, cache_path, top_k=None, min_similarity=0.0):
     """Rank messages by cosine similarity to the query.
 
-    Returns a list of (index, similarity) best-first, skipping the system
-    message. Embeddings are L2-normalized, so a dot product is cosine similarity.
-
-    `min_similarity` is a relevance floor: matches below it are dropped. Unlike
-    Letta (whose search is agent-invoked, so the LLM filters relevance), we
-    auto-inject results, so we need this floor to avoid injecting noise.
+    Returns (index, similarity) best-first, skipping the system message.
+    Embeddings are L2-normalized, so a dot product is cosine similarity.
+    `min_similarity` is a relevance floor: matches below it are dropped.
     """
     if not messages:
         return []
@@ -115,9 +97,9 @@ def vector_rank(query, messages, cache_path, top_k=None, min_similarity=0.0):
     ranked = []
     for i in np.argsort(-sims):  # descending similarity
         if sims[i] < min_similarity:
-            break  # everything after this is lower; stop (relevance floor)
+            break  # the rest are lower; stop (relevance floor)
         if messages[i]["role"] == "system":
-            continue  # the system prompt is always present; skip it
+            continue
         ranked.append((int(i), float(sims[i])))
         if top_k is not None and len(ranked) >= top_k:
             break
